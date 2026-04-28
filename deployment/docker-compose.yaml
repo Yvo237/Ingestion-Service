@@ -1,0 +1,31 @@
+services:
+  data_collection_service:
+    container_name: data_collection_service
+    build:
+      context: ../
+      dockerfile: Dockerfile
+      target: development
+    volumes:
+      - ../:/app:delegated
+      - /app/tmp
+      - /app/__pycache__
+    working_dir: /app
+    environment:
+      - PYTHONPATH=/app
+      - PYTHONUNBUFFERED=1
+      - ENV=development
+      - PORT=8001
+      - HOST=0.0.0.0
+      - DATABASE_URL=postgresql://admin:admin1234@analysis_db:5432/analysis_db
+      - ANALYSIS_SERVICE_URL=http://analysis_service:8000/v1/analysis
+      - NOTIFICATION_SERVICE_URL=http://notification_service:8002
+    ports:
+      - "8001:8001"
+    networks:
+      - analysis_network
+    depends_on:
+      - postgres
+      - redis
+      - notification_service
+      - analysis_service
+    restart: unless-stopped
