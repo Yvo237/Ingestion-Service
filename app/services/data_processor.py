@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 from typing import Dict, Any, List, Tuple
 from sklearn.preprocessing import StandardScaler, MinMaxScaler, LabelEncoder
-from sklearn.impute import SimpleImputer, KNNImputer
+from sklearn.impute import SimpleImputer
 from feature_engine.imputation import MeanMedianImputer, ArbitraryNumberImputer
 from feature_engine.outliers import Winsorizer, OutlierTrimmer
 from feature_engine.encoding import RareLabelEncoder
@@ -21,6 +21,8 @@ class DataProcessor:
     def process_dataset(self, df: pd.DataFrame, profile_result: Dict[str, Any]) -> Tuple[pd.DataFrame, Dict[str, Any]]:
         """Pipeline complet de traitement avec data lineage"""
         
+        # Always work on a copy to avoid SettingWithCopyWarning and keep original data intact
+        df = df.copy()
         self.original_shape = df.shape
         self.processing_log = []
         
@@ -40,7 +42,7 @@ class DataProcessor:
         df = self._feature_engineering(df)
         
         # Générer le data lineage final
-        lineage = self._generate_lineage()
+        lineage = self._generate_lineage(final_shape=df.shape)
         
         return df, lineage
     
@@ -79,7 +81,7 @@ class DataProcessor:
         
         # Nettoyer les noms de colonnes
         original_columns = df.columns.tolist()
-        df.columns = df.columns.str.strip().str.lower().str.replace(' ', '_').str.replace('[^\w]', '_', regex=True)
+        df.columns = df.columns.str.strip().str.lower().str.replace(' ', '_').str.replace(r'[^\w]', '_', regex=True)
         
         if df.columns.tolist() != original_columns:
             self._add_log('basic_cleaning', 'clean_column_names', {
@@ -109,32 +111,32 @@ class DataProcessor:
                     'missing_ratio': missing_ratio,
                     'reason': 'too many missing values (>50%)'
                 })
-            elif df[column].dtype in ['int64', 'float64']:
+            elif pd.api.types.is_numeric_dtype(df[column]):
                 # Colonnes numériques
                 if missing_ratio < 0.1:
                     # Moins de 10% -> imputation par médiane
                     median_value = df[column].median()
-                    df[column] = df[column].fillna(median_value)
+                    df.loc[:, column] = df[column].fillna(median_value)
                     self._add_log('missing_values', 'impute_median', {
                         'column': column,
                         'missing_count': missing_count,
                         'imputed_value': median_value
                     })
                 else:
-                    # 10-50% -> imputation KNN
-                    imputer = KNNImputer(n_neighbors=5)
-                    df[[column]] = imputer.fit_transform(df[[column]])
-                    self._add_log('missing_values', 'impute_knn', {
+                    # 10-50% -> imputation par médiane pour réduire la complexité
+                    imputer = SimpleImputer(strategy='median')
+                    df.loc[:, column] = imputer.fit_transform(df[[column]]).ravel()
+                    self._add_log('missing_values', 'impute_median', {
                         'column': column,
                         'missing_count': missing_count,
-                        'method': 'KNN (k=5)'
+                        'method': 'median'
                     })
             else:
-                # Colonnes catégorielles
+                # Colonnes catégorielles et non numériques
                 if missing_ratio < 0.2:
                     # Moins de 20% -> imputation par mode
                     mode_value = df[column].mode()[0] if not df[column].mode().empty else 'unknown'
-                    df[column] = df[column].fillna(mode_value)
+                    df.loc[:, column] = df[column].fillna(mode_value)
                     self._add_log('missing_values', 'impute_mode', {
                         'column': column,
                         'missing_count': missing_count,
@@ -142,7 +144,7 @@ class DataProcessor:
                     })
                 else:
                     # Plus de 20% -> catégorie 'missing'
-                    df[column] = df[column].fillna('missing')
+                    df.loc[:, column] = df[column].fillna('missing')
                     self._add_log('missing_values', 'impute_missing_category', {
                         'column': column,
                         'missing_count': missing_count,
@@ -280,11 +282,11 @@ class DataProcessor:
         
         return df
     
-    def _generate_lineage(self) -> Dict[str, Any]:
+    def _generate_lineage(self, final_shape: tuple) -> Dict[str, Any]:
         """Génère le data lineage complet"""
         return {
             'original_shape': self.original_shape,
-            'final_shape': None,  # Sera rempli après le traitement
+            'final_shape': final_shape,
             'transformations': self.processing_log,
             'quality_improvements': self._calculate_quality_improvements(),
             'processing_summary': {

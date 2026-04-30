@@ -1,31 +1,34 @@
 services:
-  data_collection_service:
-    container_name: data_collection_service
+  ingestion_service:
+    container_name: ingestion_service
     build:
       context: ../
       dockerfile: Dockerfile
-      target: development
-    volumes:
-      - ../:/app:delegated
-      - /app/tmp
-      - /app/__pycache__
-    working_dir: /app
+      target: production
     environment:
-      - PYTHONPATH=/app
-      - PYTHONUNBUFFERED=1
-      - ENV=development
+      - ENV=production
       - PORT=8001
       - HOST=0.0.0.0
-      - DATABASE_URL=postgresql://admin:admin1234@analysis_db:5432/analysis_db
-      - ANALYSIS_SERVICE_URL=http://analysis_service:8000/v1/analysis
-      - NOTIFICATION_SERVICE_URL=http://notification_service:8002
-    ports:
-      - "8001:8001"
+      - DATABASE_URL=postgresql://${DB_USER:-admin}:${DB_PASSWORD:-password}@analysis_db:5432/${DB_NAME:-analysis_db}
+      - ANALYSIS_SERVICE_URL=http://analytics_service:8000/v1/analysis
     networks:
       - analysis_network
     depends_on:
       - postgres
       - redis
-      - notification_service
-      - analysis_service
+      - analytics_service
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8001/v1/health').raise_for_status()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+        reservations:
+          cpus: '0.1'
+          memory: 128M

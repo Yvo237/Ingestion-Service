@@ -1,11 +1,17 @@
 from fastapi import FastAPI, Depends, UploadFile, File, Form, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+import os
+import uuid
+import shutil
+import redis
+import asyncio
+from pathlib import Path
 from sqlalchemy.orm import Session
 import json
 from datetime import datetime
 from app.infrastructure.database.config import get_db, engine
 from app.infrastructure.database.models import Base, DatasetModel
-from app.use_cases.process_analysis import ProcessAnalysisUseCase
+from app.tasks.data_tasks import process_and_analyze_task
 from app.adapters.api.endpoints import router
 
 # Créer les tables au démarrage
@@ -25,150 +31,238 @@ app.add_middleware(
 # Include les API router
 app.include_router(router)
 
-@app.post("/collect-and-analyze")
-async def collect_and_analyze(
+@app.post("/upload")
+async def upload_dataset(
     user_id: str = Form(...),
     dataset_name: str = Form(...),
-    analysis_endpoint: str = Form(...), # ex: "regression/linear"
-    params: str = Form(...),            # JSON string des colonnes
-    file: UploadFile = File(...),
+    file: UploadFile = File(..., size=500 * 1024 * 1024),  # 500MB limit
     db: Session = Depends(get_db)
 ):
-    # DEBUG: Log des données reçues
-    print(f"=== DEBUG REQUÊTE ===")
-    print(f"user_id: {user_id}")
-    print(f"dataset_name: {dataset_name}")
-    print(f"analysis_endpoint: {analysis_endpoint}")
-    print(f"params: {params}")
+    if not file.filename.endswith('.csv'):
+        raise HTTPException(status_code=400, detail="Seuls les fichiers CSV sont acceptés")
+    
+    # Sauvegarder le fichier temporairement
+    storage_path = Path("storage")
+    storage_path.mkdir(exist_ok=True)
+    
+    file_id = str(uuid.uuid4())
+    file_extension = Path(file.filename).suffix
+    local_filename = f"{file_id}{file_extension}"
+    local_path = storage_path / local_filename
     
     try:
-        params_dict = json.loads(params)
-        print(f"params_dict: {params_dict}")
+        with local_path.open("wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
     except Exception as e:
-        print(f"ERREUR params JSON: {e}")
-        raise HTTPException(status_code=400, detail=f"Format JSON invalide: {e}")
+        raise HTTPException(status_code=500, detail=f"Erreur lors de la sauvegarde du fichier: {e}")
     
-    # 1. Lire le fichier
-    csv_bytes = await file.read()
-    print(f"Taille CSV: {len(csv_bytes)} bytes")
-    if len(csv_bytes) < 500:
-        print(f"Contenu CSV: {csv_bytes}")
-    
+    # Extraire les headers et le nombre de lignes
+    import pandas as pd
     try:
-        params_dict = json.loads(params)
+        # Lire le fichier complet pour compter les lignes et extraire les headers
+        df_full = pd.read_csv(local_path)
+        headers = df_full.columns.tolist()
+        row_count = len(df_full)
     except Exception as e:
-        print(f"ERREUR params JSON: {e}")
-        raise HTTPException(status_code=400, detail=f"Format JSON invalide: {e}")
-    
-    # 2. Lancer le use case
-    try:
-        use_case = ProcessAnalysisUseCase(db)
-        record = await use_case.execute(
-            user_id=user_id,
-            dataset_name=dataset_name,
-            analysis_type=analysis_endpoint,
-            csv_data=csv_bytes,
-            params=params_dict,
-            endpoint=analysis_endpoint
-        )
-        
-        return {"message": "Analyse réussie et stockée", "record_id": record.id, "results": record.analysis_results}
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erreur lors de l'analyse: {str(e)}")
+        # En cas d'erreur de parsing CSV, on essaie avec moins de lignes
+        try:
+            df = pd.read_csv(local_path, nrows=1000)
+            headers = df.columns.tolist()
+            # Compter les lignes restantes
+            with open(local_path, 'r') as f:
+                row_count = sum(1 for _ in f) - 1  # -1 pour l'en-tête
+        except Exception as e2:
+            headers = []
+            row_count = 0
 
-@app.delete("/v1/data/analysis/{analysis_id}")
-async def delete_analysis(analysis_id: int, db: Session = Depends(get_db)):
-    """Supprime une analyse spécifique"""
+    # Créer l'entrée en base avec le statut 'uploaded'
+    new_record = DatasetModel(
+        user_id=user_id,
+        name=dataset_name,
+        status="uploaded",
+        headers=headers,
+        row_count=row_count,
+        file_size=os.path.getsize(local_path),
+        # On utilise file_hash pour stocker le nom du fichier local
+        file_hash=local_filename # On utilise file_hash pour stocker le nom du fichier local
+    )
+    
+    db.add(new_record)
+    db.commit()
+    db.refresh(new_record)
+    
+    return {
+        "message": "Fichier uploadé avec succès",
+        "dataset_id": new_record.id,
+        "status": "uploaded",
+        "headers": headers
+    }
+
+@app.post("/analyze/{dataset_id}")
+async def analyze_dataset(
+    dataset_id: int,
+    analysis_endpoint: str = Form(...), # ex: "regression/linear"
+    params: str = Form(...),            # JSON string des colonnes
+    db: Session = Depends(get_db)
+):
+    dataset = db.query(DatasetModel).filter(DatasetModel.id == dataset_id).first()
+    if not dataset:
+        raise HTTPException(status_code=404, detail="Dataset non trouvé")
+        
+    if not dataset.file_hash:
+        raise HTTPException(status_code=400, detail="Fichier local introuvable pour ce dataset")
+        
     try:
-        # Récupérer l'analyse
-        analysis = db.query(DatasetModel).filter(DatasetModel.id == analysis_id).first()
+        params_dict = json.loads(params)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Format JSON invalide pour params: {e}")
         
-        if not analysis:
-            raise HTTPException(status_code=404, detail="Analyse non trouvée")
+    # Mettre à jour l'enregistrement
+    dataset.status = "pending"
+    dataset.analysis_type = analysis_endpoint
+    dataset.analysis_parameters = params_dict
+    db.commit()
+    
+    # Reconstruire le chemin du fichier
+    storage_path = Path("storage")
+    filename = dataset.file_hash
+    if not filename.endswith('.csv'):
+        filename = f"{filename}.csv"
+    local_path = storage_path / filename
+    
+    # Lancer la tâche asynchrone
+    process_and_analyze_task.delay(
+        record_id=dataset.id,
+        file_path=str(local_path),
+        analysis_endpoint=analysis_endpoint,
+        params=params_dict
+    )
+    
+    return {
+        "message": "Analyse lancée",
+        "dataset_id": dataset.id,
+        "status": "pending"
+    }
+
+@app.delete("/v1/data/analysis/{dataset_id}")
+async def delete_analysis(dataset_id: int, db: Session = Depends(get_db)):
+    """Supprime les données d'analyse d'un dataset sans supprimer le dataset lui-même"""
+    try:
+        # Récupérer l'enregistrement
+        dataset = db.query(DatasetModel).filter(DatasetModel.id == dataset_id).first()
         
-        # Supprimer l'analyse
-        db.delete(analysis)
+        if not dataset:
+            raise HTTPException(status_code=404, detail="Dataset non trouvé")
+        
+        # Nettoyer uniquement les données d'analyse, pas le fichier
+        dataset.analysis_type = None
+        dataset.analysis_parameters = None
+        dataset.analysis_results = None
+        dataset.status = "uploaded" # Remettre au statut d'origine
+        
         db.commit()
         
-        return {"message": "Analyse supprimée avec succès", "analysis_id": analysis_id}
+        return {"message": "Analyse arrêtée/supprimée avec succès", "dataset_id": dataset_id}
         
     except HTTPException:
         raise
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=f"Erreur lors de la suppression: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Erreur lors de la suppression de l'analyse: {str(e)}")
 
-# Gestionnaire de connexions WebSocket pour le streaming de logs
-class ConnectionManager:
-    def __init__(self):
-        self.active_connections: dict[int, list[WebSocket]] = {}
+@app.delete("/v1/data/dataset/{dataset_id}")
+async def delete_dataset(dataset_id: int, db: Session = Depends(get_db)):
+    """Supprime complètement un dataset et son fichier associé"""
+    try:
+        dataset = db.query(DatasetModel).filter(DatasetModel.id == dataset_id).first()
+        if not dataset:
+            raise HTTPException(status_code=404, detail="Dataset non trouvé")
+            
+        # Supprimer le fichier physique si présent
+        if dataset.file_hash:
+            storage_path = Path("storage")
+            local_path = storage_path / dataset.file_hash
+            if local_path.exists():
+                local_path.unlink()
+                
+        # Supprimer de la base
+        db.delete(dataset)
+        db.commit()
+        
+        return {"message": "Dataset et fichier supprimés avec succès", "dataset_id": dataset_id}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Erreur lors de la suppression du dataset: {str(e)}")
 
-    async def connect(self, websocket: WebSocket, record_id: int):
-        await websocket.accept()
-        if record_id not in self.active_connections:
-            self.active_connections[record_id] = []
-        self.active_connections[record_id].append(websocket)
-
-    def disconnect(self, websocket: WebSocket, record_id: int):
-        if record_id in self.active_connections:
-            self.active_connections[record_id].remove(websocket)
-            if not self.active_connections[record_id]:
-                del self.active_connections[record_id]
-
-    async def send_log_update(self, record_id: int, log_data: dict):
-        if record_id in self.active_connections:
-            disconnected = []
-            for connection in self.active_connections[record_id]:
-                try:
-                    await connection.send_json(log_data)
-                except:
-                    disconnected.append(connection)
-            # Nettoyer les connexions déconnectées
-            for conn in disconnected:
-                self.disconnect(conn, record_id)
-
-manager = ConnectionManager()
+# Configuration Redis
+redis_url = os.getenv("CELERY_BROKER_URL", "redis://redis_queue:6379/0")
+# On utilise la version synchrone avec to_thread pour plus de compatibilité
+redis_client = redis.from_url(redis_url, decode_responses=True)
 
 @app.websocket("/ws/logs/{record_id}")
 async def websocket_logs(websocket: WebSocket, record_id: int):
-    """Endpoint WebSocket pour le streaming de logs en temps réel"""
-    await manager.connect(websocket, record_id)
+    """Endpoint WebSocket pour le streaming de logs en temps réel via Redis Pub/Sub"""
+    await websocket.accept()
+    
+    # 1. Envoyer les logs historiques depuis la base de données
+    db = next(get_db())
     try:
-        # Envoyer les logs existants
-        db = next(get_db())
         dataset = db.query(DatasetModel).filter(DatasetModel.id == record_id).first()
-        
-        if dataset:
-            # Envoyer les logs historiques
-            historical_logs = [
-                {
-                    "timestamp": dataset.created_at.isoformat() if dataset.created_at else datetime.utcnow().isoformat(),
-                    "level": "INFO",
-                    "message": f"Analyse '{dataset.name}' démarrée",
-                    "details": {
-                        "analysis_type": dataset.analysis_type,
-                        "dataset_id": record_id
-                    }
-                }
-            ]
+        if dataset and dataset.processing_log:
+            logs = dataset.processing_log
+            if isinstance(logs, str):
+                try: logs = json.loads(logs)
+                except: logs = []
             
-            for log in historical_logs:
-                await websocket.send_json(log)
-        
-        # Maintenir la connexion ouverte et écouter les nouveaux logs
-        while True:
+            if isinstance(logs, list):
+                for entry in logs:
+                    await websocket.send_json({
+                        "timestamp": entry.get("timestamp", datetime.utcnow().isoformat()),
+                        "level": "INFO",
+                        "message": entry.get("message", ""),
+                        "details": {"analysis_type": entry.get("step", "process"), "dataset_id": record_id}
+                    })
+    finally:
+        db.close()
+
+    # 2. S'abonner aux nouveaux logs via Redis Pub/Sub
+    pubsub = redis_client.pubsub()
+    pubsub.subscribe(f"logs:{record_id}")
+    
+    async def redis_listener():
+        try:
+            while True:
+                # On utilise to_thread pour l'appel bloquant get_message
+                message = await asyncio.to_thread(pubsub.get_message, ignore_subscribe_messages=True, timeout=1.0)
+                if message and message['data']:
+                    await websocket.send_text(message['data'])
+                await asyncio.sleep(0.1)
+        except Exception as e:
+            # Souvent causé par la fermeture du WebSocket ou l'annulation de la tâche
+            pass
+        finally:
             try:
-                # Attendre des messages ping/pong pour maintenir la connexion
-                await websocket.receive_text()
-            except WebSocketDisconnect:
-                break
-                
+                pubsub.unsubscribe(f"logs:{record_id}")
+                pubsub.close()
+            except: pass
+
+    # Lancer le listener en arrière-plan
+    listener_task = asyncio.create_task(redis_listener())
+    
+    try:
+        # On attend la déconnexion du client
+        while True:
+            await websocket.receive_text()
     except WebSocketDisconnect:
         pass
+    except Exception as e:
+        print(f"WebSocket error for record {record_id}: {e}")
     finally:
-        manager.disconnect(websocket, record_id)
+        listener_task.cancel()
+        try:
+            await listener_task
+        except asyncio.CancelledError:
+            pass
 
 @app.post("/v1/logs/{record_id}/stream")
 async def stream_log(record_id: int, log_data: dict):
@@ -201,23 +295,11 @@ async def health_check():
         import httpx
         analysis_start = time.time()
         async with httpx.AsyncClient(timeout=5.0) as client:
-            response = await client.get("http://analysis_service:8000/health")
+            response = await client.get("http://analytics_service:8000/health")
             analysis_healthy = response.status_code == 200
             analysis_latency = round((time.time() - analysis_start) * 1000, 2)
     except Exception:
         analysis_healthy = False
-    
-    # Vérifier le service de notification
-    notification_healthy = False
-    notification_latency = None
-    try:
-        notification_start = time.time()
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            response = await client.get("http://notification_service:8002/health")
-            notification_healthy = response.status_code == 200
-            notification_latency = round((time.time() - notification_start) * 1000, 2)
-    except Exception:
-        notification_healthy = False
     
     # Vérifier la base de données
     db_healthy = False
@@ -266,25 +348,11 @@ async def health_check():
         "memory": None,
         "description": "FastAPI + Scikit-learn workers (Celery)",
         "details": {
-            "endpoint": "http://analysis_service:8000"
+            "endpoint": "http://analytics_service:8000"
         }
     })
     
-    # Service de notification
-    services.append({
-        "name": "Notification Service",
-        "kind": "service",
-        "status": "online" if notification_healthy else "offline",
-        "uptime": f"{uptime_days}d {uptime_hours}h",
-        "latencyMs": notification_latency or 999,
-        "cpu": None,
-        "memory": None,
-        "description": "FastAPI notification service",
-        "details": {
-            "endpoint": "http://notification_service:8002"
-        }
-    })
-    
+    # Les services restants sont sains
     overall_status = "online" if all(s["status"] == "online" for s in services) else "degraded"
     
     return {
@@ -429,45 +497,8 @@ async def get_processing_logs(record_id: int):
 
 @app.post("/test-notification/{dataset_id}")
 async def test_notification(dataset_id: int):
-    """Teste l'envoi d'une notification Kaggle"""
-    try:
-        from app.services.notification_client import NotificationClient
-        import asyncio
-        
-        # Récupérer le dataset
-        db = next(get_db())
-        dataset = db.query(DatasetModel).filter(DatasetModel.id == dataset_id).first()
-        
-        if not dataset:
-            raise HTTPException(status_code=404, detail="Dataset not found")
-        
-        # Préparer les données de test
-        dataset_data = {
-            'id': dataset.id,
-            'name': dataset.name,
-            'status': dataset.status,
-            'quality_score': float(dataset.quality_score) if dataset.quality_score else 0,
-        }
-        
-        result = {
-            'success': True,
-            'action': 'created',
-            'visibility': 'public',
-            'dataset_url': f'https://kaggle.com/datasets/test/{dataset.name}',
-            'published_at': datetime.utcnow().isoformat()
-        }
-        
-        # Envoyer la notification
-        notification_client = NotificationClient()
-        notification_sent = await notification_client.send_kaggle_notification(dataset_data, result)
-        
-        return {
-            "message": "Test notification sent",
-            "dataset_id": dataset_id,
-            "notification_sent": notification_sent
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to send test notification: {str(e)}")
+    """Endpoint supprimé - notifications non supportées"""
+    raise HTTPException(status_code=410, detail="Notifications feature has been removed")
 
 @app.put("/v1/data/datasets/{dataset_id}")
 async def update_dataset(dataset_id: int, dataset_data: dict):
@@ -505,20 +536,8 @@ async def update_dataset(dataset_id: int, dataset_data: dict):
 
 @app.post("/v1/kaggle/publish/{dataset_id}")
 async def trigger_kaggle_publication(dataset_id: int):
-    """Déclenche la publication automatique Kaggle avec vérification des conditions"""
-    try:
-        from app.tasks.kaggle_tasks import publish_to_kaggle_task
-        
-        # Lancer la tâche Celery
-        task = publish_to_kaggle_task.delay(dataset_id)
-        
-        return {
-            "message": f"Kaggle publication task started for dataset {dataset_id}",
-            "task_id": task.id,
-            "dataset_id": dataset_id
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to start Kaggle publication: {str(e)}")
+    """Endpoint supprimé - publication Kaggle non supportée"""
+    raise HTTPException(status_code=410, detail="Kaggle publication feature has been removed")
 
 @app.get("/v1/tasks/status/{task_id}")
 async def get_task_status(task_id: str):
@@ -556,17 +575,8 @@ async def set_published(dataset_id: int):
         if not dataset:
             raise HTTPException(status_code=404, detail="Dataset not found")
         
-        # Mettre à jour le statut et les infos Kaggle
+        # Mettre à jour le statut
         dataset.status = "published"
-        dataset.kaggle_info = {
-            "published": True,
-            "action": "created",
-            "visibility": "public",
-            "dataset_url": f"https://kaggle.com/datasets/test/{dataset.name}",
-            "published_at": datetime.utcnow().isoformat(),
-            "download_count": 150,
-            "vote_count": 25
-        }
         
         db.commit()
         
@@ -583,21 +593,27 @@ async def root_health():
     """Health check endpoint pour le service principal"""
     return {
         "status": "healthy",
-        "service": "data_collection_service",
+        "service": "ingestion_service",
         "version": "1.0.0"
     }
 
 @app.get("/notifications")
-async def get_notifications():
-    """Proxy pour récupérer les notifications depuis le service de notification"""
+async def get_notifications(db: Session = Depends(get_db)):
+    """Récupère les logs des emails envoyés depuis la base de données"""
     try:
-        import httpx
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get("http://notification_service:8002/logs")
-            if response.status_code == 200:
-                return response.json()
-            else:
-                return []
+        logs = db.query(EmailLogModel).order_by(EmailLogModel.sent_at.desc()).limit(50).all()
+        return [
+            {
+                "id": log.id,
+                "type": log.email_type,
+                "recipient": log.recipient_email,
+                "subject": log.subject,
+                "status": log.status,
+                "error": log.error_message,
+                "timestamp": log.sent_at.isoformat() if log.sent_at else None
+            }
+            for log in logs
+        ]
     except Exception as e:
         print(f"Error fetching notifications: {str(e)}")
         return []

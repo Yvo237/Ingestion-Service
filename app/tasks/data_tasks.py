@@ -11,219 +11,32 @@ from app.infrastructure.database.models import DatasetModel, ProcessingLogModel
 from sqlalchemy.orm import Session
 from datetime import datetime
 import logging
+import os
+import re
+import redis
+import io
+import math
+from app.infrastructure.clients.analysis_client import AnalysisClient
+from app.utils.helpers import clean_column_name, sanitize_json
 
 logger = logging.getLogger(__name__)
 
+# Configuration Redis pour le broadcast de logs en temps réel
+redis_client = redis.from_url(os.getenv("CELERY_BROKER_URL", "redis://redis_queue:6379/0"))
 
-@celery_app.task(bind=True)
-def process_dataset_task(self, dataset_id: int, csv_content: str, user_id: str, 
-                        dataset_name: str, analysis_type: str, analysis_parameters: Dict[str, Any]):
-    """
-    Tâche Celery pour traiter un dataset de manière asynchrone
-    """
+def broadcast_log(record_id: int, message: str, level: str = "INFO", step: str = "system"):
+    """Envoie un log en temps réel via Redis Pub/Sub"""
     try:
-        # Mettre à jour le statut du dataset
-        db = next(get_db())
-        dataset = db.query(DatasetModel).filter(DatasetModel.id == dataset_id).first()
-        
-        if not dataset:
-            raise ValueError(f"Dataset {dataset_id} not found")
-        
-        # Mettre à jour le statut en "processing"
-        dataset.status = "processing"
-        db.commit()
-        
-        # Mettre à jour la progression de la tâche
-        self.update_state(state="PROCESSING", meta={"progress": 10, "status": "Starting processing"})
-        
-        # Étape 1: Charger et parser le CSV
-        df = pd.read_csv(io.StringIO(csv_content))
-        
-        # Mettre à jour la progression
-        self.update_state(state="PROCESSING", meta={"progress": 20, "status": "CSV loaded"})
-        
-        # Étape 2: Profiling avec data profiler
-        profiler = DataProfiler()
-        profile_result = profiler.analyze_dataset(df, dataset_name)
-        
-        # Mettre à jour la progression
-        self.update_state(state="PROCESSING", meta={"progress": 40, "status": "Profiling completed"})
-        
-        # Étape 3: Traitement et nettoyage
-        processor = DataProcessor()
-        cleaned_df, lineage = processor.process_dataset(df, profile_result)
-        
-        # Mettre à jour la progression
-        self.update_state(state="PROCESSING", meta={"progress": 60, "status": "Data cleaning completed"})
-        
-        # Étape 4: Calculer les hashes
-        file_hash = profiler.generate_file_hash(csv_content)
-        content_hash = profiler.generate_content_hash(df)
-        
-        # Étape 5: Vérification anti-doublons
-        is_duplicate = False
-        duplicate_reason = None
-        
-        # Vérifier dans la base locale
-        existing_dataset = db.query(DatasetModel).filter(
-            DatasetModel.file_hash == file_hash
-        ).first()
-        
-        if existing_dataset and existing_dataset.id != dataset_id:
-            is_duplicate = True
-            duplicate_reason = "Duplicate in local database"
-        
-        # Mettre à jour la progression
-        self.update_state(state="PROCESSING", meta={"progress": 70, "status": "Duplicate check completed"})
-        
-        # Étape 6: Préparer les données pour la base
-        raw_data_json = df.to_dict(orient='records')
-        cleaned_data_json = cleaned_df.to_dict(orient='records')
-        
-        # Mettre à jour le dataset avec les résultats
-        dataset.raw_data = raw_data_json
-        dataset.cleaned_data = cleaned_data_json
-        dataset.headers = df.columns.tolist()
-        dataset.row_count = len(df)
-        dataset.file_size = len(csv_content.encode('utf-8'))
-        dataset.file_hash = file_hash
-        dataset.dataset_metadata = {
-            **profile_result['basic_metrics'],
-            **profile_result['completeness_metrics'],
-            'type_metrics': profile_result['type_metrics'],
-            'profiling_summary': {
-                'alerts_count': len(profile_result['alerts']),
-                'correlations_count': len(profile_result['correlations']),
-                'quality_score': profile_result['quality_score']
-            }
+        log_entry = {
+            "timestamp": datetime.utcnow().isoformat(),
+            "level": level,
+            "message": message,
+            "details": {"analysis_type": step, "dataset_id": record_id}
         }
-        dataset.processing_log = lineage
-        dataset.quality_score = profile_result['quality_score']
-        dataset.analysis_type = analysis_type
-        dataset.analysis_parameters = analysis_parameters
-        
-        # Déterminer le statut final
-        if is_duplicate:
-            dataset.status = "rejected"
-            dataset.kaggle_info = {
-                "rejected": True,
-                "reason": duplicate_reason,
-                "rejected_at": datetime.utcnow().isoformat()
-            }
-        elif profile_result['quality_score'] >= 8.0:
-            dataset.status = "premium"
-        elif profile_result['quality_score'] >= 6.0:
-            dataset.status = "cleaned"
-        else:
-            dataset.status = "rejected"
-            dataset.kaggle_info = {
-                "rejected": True,
-                "reason": f"Low quality score: {profile_result['quality_score']}",
-                "rejected_at": datetime.utcnow().isoformat()
-            }
-        
-        # Mettre à jour la progression
-        self.update_state(state="PROCESSING", meta={"progress": 80, "status": "Status determination completed"})
-        
-        # Étape 7: Logger les étapes de traitement
-        for log_entry in lineage.get('transformations', []):
-            processing_log = ProcessingLogModel(
-                dataset_id=dataset_id,
-                log_level="INFO",
-                step=log_entry['step'],
-                message=log_entry['action'],
-                details=log_entry.get('details', {})
-            )
-            db.add(processing_log)
-        
-        # Logger le profilage
-        processing_log = ProcessingLogModel(
-            dataset_id=dataset_id,
-            log_level="INFO",
-            step="profiling",
-            message="Quality profiling completed",
-            details={
-                "quality_score": profile_result['quality_score'],
-                "alerts_count": len(profile_result['alerts']),
-                "completeness_ratio": profile_result['completeness_metrics']['completeness_ratio']
-            }
-        )
-        db.add(processing_log)
-        
-        # Logger le résultat final
-        processing_log = ProcessingLogModel(
-            dataset_id=dataset_id,
-            log_level="INFO" if not is_duplicate else "WARNING",
-            step="finalization",
-            message=f"Processing completed - Status: {dataset.status}",
-            details={
-                "final_quality_score": profile_result['quality_score'],
-                "is_duplicate": is_duplicate,
-                "duplicate_reason": duplicate_reason,
-                "final_shape": cleaned_df.shape
-            }
-        )
-        db.add(processing_log)
-        
-        # Commit des changements
-        db.commit()
-        
-        # Mettre à jour la progression finale
-        result = {
-            "progress": 100,
-            "status": "completed",
-            "dataset_id": dataset_id,
-            "final_status": dataset.status,
-            "quality_score": profile_result['quality_score'],
-            "is_duplicate": is_duplicate,
-            "duplicate_reason": duplicate_reason,
-            "final_shape": cleaned_df.shape,
-            "recommendations": profiler.get_quality_recommendations(profile_result)
-        }
-        
-        self.update_state(state="SUCCESS", meta=result)
-        
-        return result
-        
+        redis_client.publish(f"logs:{record_id}", json.dumps(log_entry))
     except Exception as e:
-        logger.error(f"Error processing dataset {dataset_id}: {str(e)}")
-        
-        # Mettre à jour le statut en erreur
-        try:
-            db = next(get_db())
-            dataset = db.query(DatasetModel).filter(DatasetModel.id == dataset_id).first()
-            if dataset:
-                dataset.status = "rejected"
-                dataset.kaggle_info = {
-                    "rejected": True,
-                    "reason": f"Processing error: {str(e)}",
-                    "rejected_at": datetime.utcnow().isoformat()
-                }
-                
-                # Logger l'erreur
-                processing_log = ProcessingLogModel(
-                    dataset_id=dataset_id,
-                    log_level="ERROR",
-                    step="processing",
-                    message=f"Processing failed: {str(e)}",
-                    details={"error_type": type(e).__name__}
-                )
-                db.add(processing_log)
-                db.commit()
-        except Exception as db_error:
-            logger.error(f"Failed to update database with error status: {str(db_error)}")
-        
-        # Mettre à jour l'état de la tâche
-        self.update_state(
-            state="FAILURE", 
-            meta={
-                "error": str(e),
-                "dataset_id": dataset_id,
-                "status": "failed"
-            }
-        )
-        
-        raise
+        logger.error(f"Failed to broadcast log: {e}")
+
 
 
 @celery_app.task
@@ -262,14 +75,8 @@ def cleanup_old_datasets():
 def update_quality_scores():
     """
     Tâche périodique pour mettre à jour les scores de qualité
-    basée sur le feedback des publications Kaggle
     """
     try:
-        db = next(get_db())
-        
-        # Logique pour mettre à jour les scores basée sur les métriques Kaggle
-        # Ceci est un placeholder - à implémenter selon les besoins
-        
         logger.info("Quality scores update task completed")
         
         return {"status": "completed", "updated_count": 0}
@@ -277,3 +84,136 @@ def update_quality_scores():
     except Exception as e:
         logger.error(f"Error in quality scores update task: {str(e)}")
         raise
+
+
+@celery_app.task(bind=True)
+def process_and_analyze_task(self, record_id: int, file_path: str, analysis_endpoint: str, params: Dict[str, Any]):
+    """
+    Pipeline asynchrone LAN v2 : Nettoyage -> Analyse ML -> Stockage -> Notification
+    """
+    db = next(get_db())
+    notification_service = None
+    analysis_client = AnalysisClient()
+    
+    try:
+        # 1. Récupérer l'enregistrement
+        dataset = db.query(DatasetModel).filter(DatasetModel.id == record_id).first()
+        if not dataset:
+            logger.error(f"Record {record_id} not found")
+            return
+        
+        dataset.status = "processing"
+        db.commit()
+        
+        self.update_state(state="PROCESSING", meta={"progress": 5, "status": "Initialisation"})
+        
+        broadcast_log(record_id, "Début du traitement du dataset...", "INFO", "system")
+        lineage = [{"step": "start", "message": "Initialisation du pipeline", "timestamp": datetime.utcnow().isoformat()}]
+        
+        # 2. Charger le CSV
+        if not os.path.exists(file_path):
+            # Essayer avec l'extension .csv si elle manque
+            if not file_path.endswith('.csv'):
+                file_path += '.csv'
+            
+            if not os.path.exists(file_path):
+                broadcast_log(record_id, f"Fichier source non trouvé : {file_path}", "ERROR", "io")
+                raise FileNotFoundError(f"Fichier non trouvé : {file_path}")
+            
+        broadcast_log(record_id, "Chargement des données CSV...", "INFO", "io")
+        df = pd.read_csv(file_path)
+        lineage.append({"step": "loading", "message": f"Chargement réussi ({len(df)} lignes)", "timestamp": datetime.utcnow().isoformat()})
+        self.update_state(state="PROCESSING", meta={"progress": 20, "status": "Données chargées"})
+        
+        # 3. Nettoyage (CPU intensif)
+        broadcast_log(record_id, "Nettoyage et profilage des données...", "INFO", "clean")
+        processor = DataProcessor()
+        profiler = DataProfiler()
+        profile_result = profiler.analyze_dataset(df, dataset.name)
+        cleaned_df, cleaning_lineage = processor.process_dataset(df, profile_result)
+        
+        lineage.append({"step": "cleaning", "message": "Nettoyage terminé", "timestamp": datetime.utcnow().isoformat()})
+        self.update_state(state="PROCESSING", meta={"progress": 50, "status": "Nettoyage terminé"})
+        
+        # Convertir en bytes pour l'envoi au service d'analyse
+        csv_buffer = io.StringIO()
+        cleaned_df.to_csv(csv_buffer, index=False)
+        csv_bytes = csv_buffer.getvalue().encode('utf-8')
+        
+        # 4. Analyse ML (Appel au microservice Analytics)
+        broadcast_log(record_id, f"Envoi au moteur ML ({analysis_endpoint})...", "INFO", "ml")
+        
+        # Remapper les colonnes dans params
+        cleaned_params = params.copy()
+        for key in ["x_columns", "feature_columns"]:
+            if key in cleaned_params and isinstance(cleaned_params[key], list):
+                cleaned_params[key] = [clean_column_name(c) for c in cleaned_params[key]]
+        
+        for key in ["y_column", "target_column"]:
+            if key in cleaned_params and isinstance(cleaned_params[key], str):
+                cleaned_params[key] = clean_column_name(cleaned_params[key])
+        
+        try:
+            analysis_results = analysis_client.sync_call_analysis(analysis_endpoint, csv_bytes, cleaned_params)
+            broadcast_log(record_id, "Analyse terminée avec succès", "SUCCESS", "ml")
+            self.update_state(state="PROCESSING", meta={"progress": 90, "status": "Analyse ML terminée"})
+        except Exception as api_err:
+            broadcast_log(record_id, f"Échec de l'analyse : {str(api_err)}", "ERROR", "ml")
+            raise Exception(f"Erreur lors de l'analyse ML : {str(api_err)}")
+        
+        # 5. Sauvegarde des fichiers et mise à jour de la base de données
+        storage_dir = "/app/storage/processed"
+        os.makedirs(storage_dir, exist_ok=True)
+        
+        cleaned_csv_path = os.path.join(storage_dir, f"cleaned_{record_id}.csv")
+        results_json_path = os.path.join(storage_dir, f"results_{record_id}.json")
+        
+        # Sauvegarder le CSV complet sur disque pour éviter de saturer la DB
+        cleaned_df.to_csv(cleaned_csv_path, index=False)
+        
+        # Sauvegarder les résultats ML complets sur disque
+        with open(results_json_path, 'w') as f:
+            json.dump(sanitize_json(analysis_results), f)
+            
+        dataset.status = "analyzed"
+        dataset.headers = cleaned_df.columns.tolist()
+        dataset.row_count = len(cleaned_df)
+        dataset.storage_path = cleaned_csv_path
+        dataset.results_path = results_json_path
+        
+        # Garder seulement un aperçu (100 premières lignes) en DB pour l'UI
+        preview_data = cleaned_df.head(100).to_dict(orient='records')
+        
+        dataset.cleaned_data = sanitize_json(preview_data)
+        # On ne garde qu'un résumé ou les métriques clés en DB pour analysis_results
+        summary_results = {k: v for k, v in analysis_results.items() if not isinstance(v, (list, dict))}
+        dataset.analysis_results = sanitize_json(summary_results)
+        
+        dataset.quality_score = profile_result.get('quality_score', 0.8)
+        dataset.processing_log = sanitize_json(lineage)
+        
+        db.commit()
+        broadcast_log(record_id, "Pipeline terminé, résultats enregistrés", "SUCCESS", "system")
+        
+        return {"status": "success", "record_id": record_id}
+        
+    except Exception as e:
+        logger.error(f"Error in process_and_analyze_task for record {record_id}: {str(e)}")
+        # Rollback important pour débloquer la session SQLAlchemy
+        try:
+            db.rollback()
+        except:
+            pass
+            
+        # Re-fetch dataset to avoid session issues
+        try:
+            dataset = db.query(DatasetModel).filter(DatasetModel.id == record_id).first()
+            if dataset:
+                dataset.status = "failed"
+                db.commit()
+        except Exception as db_err:
+            logger.error(f"Failed to update dataset status to failed: {db_err}")
+        
+        raise e
+    finally:
+        db.close()

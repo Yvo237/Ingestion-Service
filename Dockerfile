@@ -3,7 +3,7 @@
 ############################
 # Stage 1: Builder
 ############################
-FROM python:3.13-slim-bookworm AS builder
+FROM python:3.12-slim-bookworm AS builder
 
 RUN apt-get update && apt-get install -y \
     build-essential \
@@ -24,7 +24,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 ############################
 # Stage 2: Development
 ############################
-FROM python:3.13-slim-bookworm AS development
+FROM python:3.12-slim-bookworm AS development
 
 RUN apt-get update && apt-get install -y \
     build-essential \
@@ -33,7 +33,7 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 # Copier les dépendances
-COPY --from=builder /usr/local/lib/python3.13/site-packages /usr/local/lib/python3.13/site-packages
+COPY --from=builder /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
 COPY --from=builder /usr/local/bin /usr/local/bin
 
 # Copier le code source
@@ -51,7 +51,7 @@ CMD ["uvicorn", "app.adapters.main:app", "--host", "0.0.0.0", "--port", "8001", 
 ############################
 # Stage 3: Production
 ############################
-FROM python:3.13-slim-bookworm AS production
+FROM python:3.12-slim-bookworm AS production
 
 RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
@@ -59,7 +59,7 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 # Copier les dépendances du builder
-COPY --from=builder /usr/local/lib/python3.13/site-packages /usr/local/lib/python3.13/site-packages
+COPY --from=builder /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
 COPY --from=builder /usr/local/bin /usr/local/bin
 
 # Copier le code source

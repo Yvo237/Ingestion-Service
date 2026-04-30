@@ -8,6 +8,18 @@ import numpy as np
 from datetime import datetime
 
 
+class NumpyEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, (np.int_, np.intc, np.intp, np.int8,
+                            np.int16, np.int32, np.int64, np.uint8,
+                            np.uint16, np.uint32, np.uint64)):
+            return int(obj)
+        elif isinstance(obj, (np.float_, np.float16, np.float32, np.float64)):
+            return float(obj)
+        elif isinstance(obj, (np.ndarray,)):
+            return obj.tolist()
+        return json.JSONEncoder.default(self, obj)
+
 class DataProfiler:
     """Service pour analyser la qualité des données avec ydata-profiling"""
     
@@ -134,7 +146,7 @@ class DataProfiler:
                 'basic_metrics': basic_metrics,
                 'quality_score': quality_score,
                 'alerts_count': len(alerts)
-            }),
+            }, cls=NumpyEncoder),
             'analysis_timestamp': datetime.utcnow().isoformat()
         }
     

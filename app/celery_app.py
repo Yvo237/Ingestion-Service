@@ -10,7 +10,7 @@ celery_app = Celery(
     "data_processing",
     broker=os.getenv("CELERY_BROKER_URL", "redis://redis_queue:6379/0"),
     backend=os.getenv("CELERY_RESULT_BACKEND", "redis://redis_queue:6379/0"),
-    include=["app.tasks.data_tasks", "app.tasks.kaggle_tasks"]
+    include=["app.tasks.data_tasks"]
 )
 
 # Configuration
