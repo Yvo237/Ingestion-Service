@@ -22,7 +22,7 @@ app = FastAPI(title="Data Collection & Storage Service")
 # Ajouter le middleware CORS pour autoriser les requêtes du frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:8080", "http://127.0.0.1:8080"],
+    allow_origins=["http://localhost:8080", "http://127.0.0.1:8080", "https://reporting-service-chi.vercel.app"],
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE"],
     allow_headers=["*"],
